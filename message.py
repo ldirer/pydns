@@ -1,27 +1,51 @@
 from collections import namedtuple
-from pprint import pprint, pformat
+from pprint import pformat
 
 
 def int_to_bytes(i, length):
-    return int.to_bytes(i, length, 'big', signed=False)
+    return int.to_bytes(i, length, "big", signed=False)
 
 
 class RCODE:
     # we could find a nicer way to represent this... We'd still want to have RCODE.NO_ERROR be 0.
-    mapping = dict(
-        NO_ERROR=0,
-        FORMAT_ERROR=1,
-        SERVER_FAILURE=2,
-        NAME_ERROR=3,
-        NOT_IMPLEMENTED=4,
-        REFUSED=5,
-    )
+    mapping = dict(NO_ERROR=0, FORMAT_ERROR=1, SERVER_FAILURE=2, NAME_ERROR=3, NOT_IMPLEMENTED=4, REFUSED=5,)
 
     reverse_mapping = {v: k for k, v in mapping.items()}
 
     @classmethod
     def to_string(cls, c):
         return cls.reverse_mapping[c]
+
+
+class ResourceRecord:
+    def __init__(self):
+        self.name = []
+        self.type = None
+        self.class_ = None
+        self.ttl_s = None
+        self.rd_length = None
+        self.rd_data = None
+
+    @staticmethod
+    def parse(data: bytes):
+        rr = ResourceRecord()
+        rr.name, data = parse_labels(data)
+        rr.type, data = data[:2], data[2:]
+        rr.class_, data = data[:2], data[2:]
+        rr.ttl_s, data = int.from_bytes(data[:4], "big", signed=False), data[4:]
+        rr.rd_length, data = int.from_bytes(data[:2], "big", signed=False), data[2:]
+        rr.rd_data, data = data[: rr.rd_length], data[rr.rd_length :]
+        return rr, data
+
+    def to_bytes(self):
+        return (
+            labels_to_bytes(self.name)
+            + self.type
+            + self.class_
+            + int_to_bytes(self.ttl_s, 4)
+            + int_to_bytes(self.rd_length, 2)
+            + self.rd_data
+        )
 
 
 class Header:
@@ -59,15 +83,37 @@ class Header:
 
     def __repr__(self):
         return pformat(
-            {f: getattr(self, f) for f in ["transaction_id", "qr", "opcode", "opcode_nice", "aa", "tc", "rd", "ra", "z", "rcode", "qd_count", "an_count", "ns_count", "ar_count"]}
+            {
+                f: getattr(self, f)
+                for f in [
+                    "transaction_id",
+                    "qr",
+                    "opcode",
+                    "opcode_nice",
+                    "aa",
+                    "tc",
+                    "rd",
+                    "ra",
+                    "z",
+                    "rcode",
+                    "qd_count",
+                    "an_count",
+                    "ns_count",
+                    "ar_count",
+                ]
+            }
         )
 
     def to_bytes(self):
-        return self.transaction_id + \
-               int_to_bytes(self.qr | self.opcode << 1 | self.aa << 5 | self.tc << 6 | self.rd << 7, 1) + \
-               int_to_bytes(self.ra | self.z << 1 | self.rcode << 4, 1) + \
-               int_to_bytes(self.qd_count, 2) + int_to_bytes(self.an_count, 2) + int_to_bytes(self.ns_count, 2) + \
-               int_to_bytes(self.ar_count, 2)
+        return (
+            self.transaction_id
+            + int_to_bytes(self.qr | self.opcode << 1 | self.aa << 5 | self.tc << 6 | self.rd << 7, 1)
+            + int_to_bytes(self.ra | self.z << 1 | self.rcode << 4, 1)
+            + int_to_bytes(self.qd_count, 2)
+            + int_to_bytes(self.an_count, 2)
+            + int_to_bytes(self.ns_count, 2)
+            + int_to_bytes(self.ar_count, 2)
+        )
 
     def sanity_check(self):
         assert self.aa in {0, 1}, f"unexpected self.aa={self.aa}"
@@ -78,15 +124,30 @@ class Header:
 
 class Message:
     def __init__(self):
-        self.header: Header = None
-        self.questions = []
-        self.leftover_data = b''
+        self.header: Header = Header()
+        self.question = []
+        self.answer = []
+        self.authority = []
+        self.additional = []
+        self.leftover_data = b""
 
     def __repr__(self):
-        return "\n".join([repr(self.header), "================", repr(self.questions)])
+        return "\n".join([repr(self.header), "================", repr(self.question)])
 
     def to_bytes(self):
-        return self.header.to_bytes() + b''.join([q.to_bytes() for q in self.questions]) + self.leftover_data
+        return (
+            self.header.to_bytes()
+            + b"".join([q.to_bytes() for q in self.question + self.answer + self.authority + self.additional])
+            + self.leftover_data
+        )
+
+
+def labels_to_bytes(labels):
+    encoded = b""
+    for label in labels:
+        encoded += int_to_bytes(label.n_bytes, length=1)
+        encoded += label.name.encode()
+    return encoded
 
 
 class Question:
@@ -94,17 +155,14 @@ class Question:
 
     def __init__(self):
         self.qname: [Label] = []
-        self.qtype: bytes = None
-        self.qclass: bytes = None
+        self.qtype: bytes = b""
+        self.qclass: bytes = b""
 
     def __repr__(self):
         return f"qname={self.qname}\n" f"qtype={self.qtype}\n" f"qclass={self.qclass}\n"
 
     def to_bytes(self):
-        encoded = b''
-        for label in self.qname:
-            encoded += int_to_bytes(label.n_bytes, length=1)
-            encoded += label.name.encode()
+        encoded = labels_to_bytes(self.qname)
         return encoded + self.qtype + self.qclass
 
     def sanity_check(self):
@@ -127,18 +185,24 @@ Label = namedtuple("Label", field_names=("n_bytes", "name"))
 #
 
 
-def parse_question(data: bytes):
-    q = Question()
+def parse_labels(data: bytes) -> ([Label], bytes):
+    labels = []
     while True:
         len_byte, data = data[:1], data[1:]
         n_bytes = int.from_bytes(len_byte, "big", signed=False)
         name, data = data[:n_bytes].decode(), data[n_bytes:]
-        q.qname.append(Label(n_bytes, name))
+        labels.append(Label(n_bytes, name))
 
         if n_bytes == 0:
             # we reached the 'root' domain
             # The domain name terminates with the zero length octet for the null label of the root.
             break
+    return labels, data
+
+
+def parse_question(data: bytes):
+    q = Question()
+    q.qname, data = parse_labels(data)
     q.qclass = data[:2]
     q.qtype = data[2:4]
 
@@ -174,24 +238,37 @@ def parse_header(data: bytes):
     return h
 
 
+def parse_resource_records(data: bytes, n):
+    rrs = []
+    for _ in range(n):
+        rr, data = ResourceRecord.parse(data)
+        rrs.append(rr)
+
+    return rrs, data
+
+
 def parse_message(data: bytes):
     m = Message()
     header_data, body_data = data[:12], data[12:]
     m.header = parse_header(header_data)
-    m.questions, data = parse_questions(body_data, m.header.qd_count)
+    m.question, data = parse_questions(body_data, m.header.qd_count)
+    m.answer, data = parse_resource_records(data, m.header.an_count)
+    m.authority, data = parse_resource_records(data, m.header.an_count)
+    m.additional, data = parse_resource_records(data, m.header.ar_count)
 
     m.leftover_data = data
     return m
 
 
 def test_parse_message():
-    # dig_recurse = b"\xa7F\x01 \x00\x01\x00\x00\x00\x00\x00\x01\x07recurse\x03com\x00\x00\x01\x00\x01\x00\x00)\x10\x00\x00\x00\x00\x00\x00\x0c\x00\n\x00\x08\xdf\x17z\x83\x8d\x01\xa0^"
     # space is b'\x20'
-    dig_recurse = b'\\Q\x01 \x00\x01\x00\x00\x00\x00\x00\x01\x07recurse\x03com\x00\x00\x01\x00\x01\x00\x00)\x10\x00\x00\x00\x00\x00\x00\x0c\x00\n\x00\x08\x86\xd1\xfb\xf9a\xd8+\x15'
+    dig_recurse = (
+        b"\\Q\x01 \x00\x01\x00\x00\x00\x00\x00\x01\x07recurse\x03com"
+        b"\x00\x00\x01\x00\x01\x00\x00)\x10\x00\x00\x00\x00\x00\x00\x0c"
+        b"\x00\n\x00\x08\x86\xd1\xfb\xf9a\xd8+\x15"
+    )
 
     m = parse_message(dig_recurse)
-    print(f"PARSED INTO")
-    print(m)
     assert m.header.qd_count == 1
     assert m.header.rcode == 2
     encoded = m.to_bytes()
